@@ -1,4 +1,4 @@
-<img width="2048" height="1272" alt="image" src="https://github.com/user-attachments/assets/9c65b872-b898-4856-9150-f6b2422c784b" /># Argimonitor
+# Argimonitor
 
 Dashboard theo dõi giá nông sản + thủy sản, cổ phiếu liên quan, tin tức và dữ liệu insight.
 
