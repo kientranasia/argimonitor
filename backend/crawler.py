@@ -53,6 +53,31 @@ def _is_irrelevant_commodity_name(name: str):
     return n in {"việt nam", "vietnam", "thế giới", "world", "trong nước", ""}
 
 
+# Dashboard rice benchmarks (Hiệp hội Lương thực VN / AgroInfo domestic tables)
+RICE_CANONICAL_IR504 = "Giá lúa IR504"
+RICE_CANONICAL_GAO5 = "Giá gạo 5%"
+
+
+def canonicalize_rice_commodity_name(raw_name: str) -> str:
+    """
+    Map scraped row titles (VFA vietfood.org.vn, agro.gov.vn) to stable API names.
+    Sources: domestic rice pages https://vietfood.org.vn/thi-truong/gia-noi-dia/ ,
+    export quotes https://e.vietfood.org.vn/market-update/export-price/ , AgroInfo bảng giá.
+    """
+    name = (raw_name or "").strip()
+    if not name:
+        return name
+    n = name.lower()
+    compact = re.sub(r"\s+", "", n)
+    if re.search(r"ir50404|ir504", compact) or "50404" in compact:
+        return RICE_CANONICAL_IR504
+    if re.search(r"lúa[^\n]{0,32}504|lua[^\n]{0,32}504", n) and "504" in compact:
+        return RICE_CANONICAL_IR504
+    if ("gạo" in n or "gao" in n) and re.search(r"5\s*%|5%", n):
+        return RICE_CANONICAL_GAO5
+    return name
+
+
 def _normalize_category(name: str):
     n = (name or "").lower()
     if "lúa" in n or "gạo" in n or "rice" in n:
@@ -467,6 +492,7 @@ def scrape_agroinfo_price_observations():
         name = item.get("name", "").strip()
         if _is_irrelevant_commodity_name(name):
             continue
+        canon = canonicalize_rice_commodity_name(name)
         market = item.get("market", "").strip()
         date_str = item.get("date", "").strip()
         observed_at = datetime.utcnow()
@@ -476,8 +502,8 @@ def scrape_agroinfo_price_observations():
             pass
         observations.append(
             {
-                "commodity_code": re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:80],
-                "commodity_name": name,
+                "commodity_code": re.sub(r"[^a-z0-9]+", "_", canon.lower()).strip("_")[:80],
+                "commodity_name": canon,
                 "category": _normalize_category(name),
                 "subcategory": item.get("price_type", "").strip() or "spot",
                 "market": market,
@@ -551,10 +577,11 @@ def scrape_vfa_rice_observations():
                     continue
                 # Pick max valid as current quoted ceiling
                 price_value = max(valid)
+                canon = canonicalize_rice_commodity_name(name)
                 observations.append(
                     {
-                        "commodity_code": re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:80],
-                        "commodity_name": name,
+                        "commodity_code": re.sub(r"[^a-z0-9]+", "_", canon.lower()).strip("_")[:80],
+                        "commodity_name": canon,
                         "category": "rice",
                         "subcategory": "vfa",
                         "market": market,
@@ -598,7 +625,7 @@ def scrape_vfa_rice_history(days: int = 30):
             if link not in seen:
                 seen.add(link)
                 dedup.append(link)
-        for page_url in dedup[:20]:
+        for page_url in dedup[:35]:
             try:
                 page = _safe_get(page_url, timeout=12)
                 if page.status_code != 200:
@@ -643,10 +670,11 @@ def scrape_vfa_rice_history(days: int = 30):
                         if any(k in col_l for k in ["tiền giang", "long an", "đồng tháp", "cần thơ", "an giang", "bạc liêu", "kiên giang"]):
                             market = col
                             break
+                    canon = canonicalize_rice_commodity_name(name)
                     observations.append(
                         {
-                            "commodity_code": re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:80],
-                            "commodity_name": name,
+                            "commodity_code": re.sub(r"[^a-z0-9]+", "_", canon.lower()).strip("_")[:80],
+                            "commodity_name": canon,
                             "category": "rice",
                             "subcategory": "vfa_historical",
                             "market": market,
@@ -669,16 +697,19 @@ def scrape_vfa_rice_history(days: int = 30):
     return observations
 
 
-def get_normalized_price_observations():
+def get_normalized_price_observations(active_slugs: frozenset[str] | None = None):
     observations = []
-    observations.extend(scrape_agroinfo_price_observations())
-    observations.extend(scrape_vfa_rice_observations())
+    if active_slugs is None or "price_agroinfo" in active_slugs:
+        observations.extend(scrape_agroinfo_price_observations())
+    if active_slugs is None or "price_vfa_latest" in active_slugs:
+        observations.extend(scrape_vfa_rice_observations())
     return observations
 
 
-def get_normalized_price_observations_with_backfill(days: int = 30):
-    observations = get_normalized_price_observations()
-    observations.extend(scrape_vfa_rice_history(days=days))
+def get_normalized_price_observations_with_backfill(days: int = 30, active_slugs: frozenset[str] | None = None):
+    observations = get_normalized_price_observations(active_slugs=active_slugs)
+    if active_slugs is None or "price_vfa_history" in active_slugs:
+        observations.extend(scrape_vfa_rice_history(days=days))
     # keep only rows in range for backfill sources where observed_at exists
     cutoff = datetime.now() - timedelta(days=days)
     filtered = []
@@ -786,13 +817,15 @@ def fetch_live_stock_quotes():
     return data
 
 
-def get_stock_market_news():
+def get_stock_market_news(active_slugs: frozenset[str] | None = None):
     feeds = [
-        ("Vietstock", "https://vietstock.vn/rss/chung-khoan.rss"),
-        ("CafeF", "https://cafef.vn/thi-truong-chung-khoan.rss"),
+        ("stock_news_vietstock", "Vietstock", "https://vietstock.vn/rss/chung-khoan.rss"),
+        ("stock_news_cafef", "CafeF", "https://cafef.vn/thi-truong-chung-khoan.rss"),
     ]
     items = []
-    for source, url in feeds:
+    for slug, source, url in feeds:
+        if active_slugs is not None and slug not in active_slugs:
+            continue
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries[:10]:
@@ -914,19 +947,27 @@ def persist_article_markdown(
     file_path.write_text(content, encoding="utf-8")
     return str(file_path)
 
-def get_latest_news():
+_NEWS_SCRAPER_SPECS: tuple[tuple[str, object], ...] = (
+    ("news_tepbac", scrape_tepbac),
+    ("news_vnexpress", scrape_agriculture_vn),
+    ("news_intrafish", scrape_international),
+    ("news_agromonitor", scrape_agromonitor_news),
+    ("news_agroinfo", scrape_agro_gov_news),
+    ("news_vitic", scrape_vitic_news),
+)
+
+
+def get_latest_news(active_slugs: frozenset[str] | None = None):
     news_items = []
-    news_items.extend(scrape_tepbac())
-    news_items.extend(scrape_agriculture_vn())
-    news_items.extend(scrape_international())
-    news_items.extend(scrape_agromonitor_news())
-    news_items.extend(scrape_agro_gov_news())
-    news_items.extend(scrape_vitic_news())
-    
+    for slug, fn in _NEWS_SCRAPER_SPECS:
+        if active_slugs is not None and slug not in active_slugs:
+            continue
+        news_items.extend(fn())
+
     news_items = [x for x in news_items if not news_item_is_nav_noise(x.get("link", ""), x.get("title", ""))]
 
-    # Sort by time mock if we wanted, but appending sequentially is fine
-    if not news_items:
+    # Placeholder only for legacy callers (no slug filter); avoid dummy rows when user disabled all news feeds.
+    if not news_items and active_slugs is None:
         news_items = [
             {
                 "source": "System Core",

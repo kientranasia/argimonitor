@@ -126,6 +126,7 @@ def read_root():
 from database import SessionLocal
 from models import (
     CommodityPrice,
+    CrawlerSource,
     NewsArticle,
     StockPrice,
     PriceObservation,
@@ -186,6 +187,8 @@ def submit_auth_config():
             "news": "POST /api/submit/news",
             "news_history": "GET /api/submit/news/history",
             "news_history_delete": "DELETE /api/submit/news/history/{id}",
+            "crawler_sources": "GET /api/submit/crawler-sources",
+            "crawler_sources_patch": "PATCH /api/submit/crawler-sources/{slug}",
         },
     }
 
@@ -210,6 +213,67 @@ class SubmitNewsRequest(BaseModel):
     source: str = Field(default="manual_submit")
     category: str = Field(default="")
     folder_type: str = Field(default="agriculture_news")
+
+
+class CrawlerSourcePatch(BaseModel):
+    enabled: bool
+
+
+def _dt_naive_utc(dt: datetime.datetime | None) -> datetime.datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
+# Canonical dashboard names ↔ legacy crawler/submit aliases (merge in /api/prices + /api/history).
+RICE_BENCHMARKS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("Giá lúa IR504", frozenset({"Giá lúa IR504", "Lúa Thường (IR50404)"})),
+    ("Giá gạo 5%", frozenset({"Giá gạo 5%", "Gạo Xuất Khẩu 5%"})),
+)
+
+
+def _rice_skip_names() -> frozenset[str]:
+    return frozenset(name for _, aliases in RICE_BENCHMARKS for name in aliases)
+
+
+def _expand_rice_history_names(commodity: str) -> list[str]:
+    c = (commodity or "").strip()
+    for _, aliases in RICE_BENCHMARKS:
+        if c in aliases:
+            return list(aliases)
+    return [c]
+
+
+def _merge_cp_and_obs_history(
+    cp_rows: list,
+    obs_rows: list,
+    range_key: str,
+) -> tuple[list[str], list[float]]:
+    """Merge CommodityPrice + PriceObservation series for charts (one point per day when not 1d)."""
+    pairs: list[tuple[datetime.datetime, float]] = []
+    for h in cp_rows:
+        t = _dt_naive_utc(h.date_recorded) or h.date_recorded
+        pairs.append((t, float(h.price)))
+    for o in obs_rows:
+        t = _dt_naive_utc(o.observed_at) or o.observed_at
+        pairs.append((t, float(o.price)))
+    pairs.sort(key=lambda x: x[0])
+    if not pairs:
+        return [], []
+    if range_key == "1d":
+        labels = [t.strftime("%H:%M") for t, _ in pairs]
+        prices = [p for _, p in pairs]
+        return labels, prices
+    by_day: dict = {}
+    for t, p in pairs:
+        day = t.date()
+        by_day[day] = (t, p)
+    sorted_days = sorted(by_day.keys())
+    labels = [by_day[d][0].strftime("%m-%d") for d in sorted_days]
+    prices = [by_day[d][1] for d in sorted_days]
+    return labels, prices
 
 
 @app.get("/api/submit/price-options")
@@ -272,12 +336,16 @@ def get_prices():
     try:
         data = []
         seafood_commodities = [
-            "Tôm Sú (Black Tiger)",
+            "Tôm Sú (Black Tiger) 20 con/kg",
+            "Tôm Sú (Black Tiger) 30 con/kg",
+            "Tôm Sú (Black Tiger) 40 con/kg",
             "Tôm Thẻ (Vannamei)",
             "Cá Ba Sa (Pangasius)",
             "Cua Thịt (Mud Crab)",
             "Cua Gạch (Egg Crab)",
         ]
+        seafood_set = frozenset(seafood_commodities)
+
         for c in seafood_commodities:
             records = (
                 db.query(CommodityPrice)
@@ -286,19 +354,109 @@ def get_prices():
                 .limit(2)
                 .all()
             )
-            latest = records[0] if records else None
-            if latest:
-                prev_price = records[1].price if len(records) > 1 else latest.price
-                diff = latest.price - prev_price
+            obs_rows = (
+                db.query(PriceObservation)
+                .filter(PriceObservation.commodity_name == c)
+                .order_by(PriceObservation.observed_at.desc())
+                .limit(2)
+                .all()
+            )
+            leg_latest = records[0] if records else None
+            leg_prev = records[1] if len(records) > 1 else None
+            obs_latest = obs_rows[0] if obs_rows else None
+            obs_prev = obs_rows[1] if len(obs_rows) > 1 else None
+            leg_t = _dt_naive_utc(leg_latest.date_recorded) if leg_latest else None
+            obs_t = _dt_naive_utc(obs_latest.observed_at) if obs_latest else None
+
+            if obs_latest is None and leg_latest is None:
+                continue
+            if obs_latest is not None and (leg_latest is None or (obs_t and leg_t and obs_t >= leg_t)):
+                prev_price = obs_prev.price if obs_prev else (leg_latest.price if leg_latest else obs_latest.price)
+                price = obs_latest.price
+                diff = price - prev_price
                 diff_pct = (diff / prev_price * 100) if prev_price else 0
-                data.append({
-                    "name": latest.name,
-                    "price": latest.price,
-                    "unit": latest.unit,
-                    "trend": latest.trend,
-                    "change_amt": round(diff, 2),
-                    "change_pct": round(diff_pct, 2),
-                })
+                data.append(
+                    {
+                        "name": obs_latest.commodity_name,
+                        "price": price,
+                        "unit": f"{obs_latest.currency}/{obs_latest.unit}",
+                        "trend": "up" if diff >= 0 else "down",
+                        "category": obs_latest.category,
+                        "change_amt": round(diff, 2),
+                        "change_pct": round(diff_pct, 2),
+                    }
+                )
+            elif leg_latest:
+                prev_price = leg_prev.price if leg_prev else leg_latest.price
+                diff = leg_latest.price - prev_price
+                diff_pct = (diff / prev_price * 100) if prev_price else 0
+                data.append(
+                    {
+                        "name": leg_latest.name,
+                        "price": leg_latest.price,
+                        "unit": leg_latest.unit,
+                        "trend": leg_latest.trend,
+                        "change_amt": round(diff, 2),
+                        "change_pct": round(diff_pct, 2),
+                    }
+                )
+
+        rice_skip = _rice_skip_names()
+        for canonical, aliases in RICE_BENCHMARKS:
+            alias_list = list(aliases)
+            records = (
+                db.query(CommodityPrice)
+                .filter(CommodityPrice.name.in_(alias_list))
+                .order_by(CommodityPrice.date_recorded.desc())
+                .limit(2)
+                .all()
+            )
+            obs_rows = (
+                db.query(PriceObservation)
+                .filter(PriceObservation.commodity_name.in_(alias_list))
+                .order_by(PriceObservation.observed_at.desc())
+                .limit(2)
+                .all()
+            )
+            leg_latest = records[0] if records else None
+            leg_prev = records[1] if len(records) > 1 else None
+            obs_latest = obs_rows[0] if obs_rows else None
+            obs_prev = obs_rows[1] if len(obs_rows) > 1 else None
+            leg_t = _dt_naive_utc(leg_latest.date_recorded) if leg_latest else None
+            obs_t = _dt_naive_utc(obs_latest.observed_at) if obs_latest else None
+
+            if obs_latest is None and leg_latest is None:
+                continue
+            if obs_latest is not None and (leg_latest is None or (obs_t and leg_t and obs_t >= leg_t)):
+                prev_price = obs_prev.price if obs_prev else (leg_latest.price if leg_latest else obs_latest.price)
+                price = obs_latest.price
+                diff = price - prev_price
+                diff_pct = (diff / prev_price * 100) if prev_price else 0
+                data.append(
+                    {
+                        "name": canonical,
+                        "price": price,
+                        "unit": f"{obs_latest.currency}/{obs_latest.unit}",
+                        "trend": "up" if diff >= 0 else "down",
+                        "category": obs_latest.category,
+                        "change_amt": round(diff, 2),
+                        "change_pct": round(diff_pct, 2),
+                    }
+                )
+            elif leg_latest:
+                prev_price = leg_prev.price if leg_prev else leg_latest.price
+                diff = leg_latest.price - prev_price
+                diff_pct = (diff / prev_price * 100) if prev_price else 0
+                data.append(
+                    {
+                        "name": canonical,
+                        "price": leg_latest.price,
+                        "unit": leg_latest.unit,
+                        "trend": leg_latest.trend,
+                        "change_amt": round(diff, 2),
+                        "change_pct": round(diff_pct, 2),
+                    }
+                )
 
         # Pull rice/agriculture from normalized observations for richer coverage
         recent_obs = (
@@ -311,6 +469,8 @@ def get_prices():
         grouped = {}
         for row in recent_obs:
             key = row.commodity_name
+            if key in seafood_set or key in rice_skip:
+                continue
             bucket = grouped.setdefault(key, [])
             if len(bucket) < 2:
                 bucket.append(row)
@@ -339,29 +499,75 @@ def get_prices():
 
 @app.post("/api/submit/price")
 def submit_price(payload: SubmitPriceRequest, _auth: bool = Depends(verify_submit_basic)):
+    """
+    Upsert by logical key: same commodity + source + market + region + price_type
+    updates the latest matching row instead of inserting another (avoids duplicate manual rows).
+    """
     db = SessionLocal()
     try:
         now = datetime.datetime.now(datetime.UTC)
-        commodity_code = re.sub(r"[^a-z0-9]+", "_", payload.commodity_name.lower()).strip("_")[:80]
+        name = payload.commodity_name.strip()
+        market = payload.market.strip()
+        region = payload.region.strip()
+        source = payload.source.strip()
+        price_type = payload.price_type.strip().lower()
+        commodity_code = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:80]
+
+        existing = (
+            db.query(PriceObservation)
+            .filter(
+                PriceObservation.commodity_name == name,
+                PriceObservation.source == source,
+                PriceObservation.market == market,
+                PriceObservation.region == region,
+                PriceObservation.price_type == price_type,
+            )
+            .order_by(PriceObservation.observed_at.desc())
+            .first()
+        )
+        if existing:
+            existing.commodity_code = commodity_code
+            existing.category = (payload.category or "agriculture").strip().lower()
+            existing.subcategory = "manual"
+            existing.price = payload.price
+            existing.currency = payload.currency.strip().upper()
+            existing.unit = payload.unit.strip().lower()
+            existing.source_url = payload.source_url.strip()
+            existing.observed_at = now
+            existing.ingested_at = now
+            existing.raw_payload = json.dumps(payload.model_dump(), ensure_ascii=False)
+            db.commit()
+            db.refresh(existing)
+            return {
+                "status": "success",
+                "message": "Price updated (existing observation)",
+                "data": {"id": existing.id, "observed_at": now.isoformat(), "updated": True},
+            }
+
         obs = PriceObservation(
             commodity_code=commodity_code,
-            commodity_name=payload.commodity_name.strip(),
+            commodity_name=name,
             category=(payload.category or "agriculture").strip().lower(),
             subcategory="manual",
-            market=payload.market.strip(),
-            region=payload.region.strip(),
+            market=market,
+            region=region,
             price=payload.price,
             currency=payload.currency.strip().upper(),
             unit=payload.unit.strip().lower(),
-            price_type=payload.price_type.strip().lower(),
-            source=payload.source.strip(),
+            price_type=price_type,
+            source=source,
             source_url=payload.source_url.strip(),
             observed_at=now,
             raw_payload=json.dumps(payload.model_dump(), ensure_ascii=False),
         )
         db.add(obs)
         db.commit()
-        return {"status": "success", "message": "Price submitted", "data": {"id": obs.id, "observed_at": now.isoformat()}}
+        db.refresh(obs)
+        return {
+            "status": "success",
+            "message": "Price submitted",
+            "data": {"id": obs.id, "observed_at": now.isoformat(), "updated": False},
+        }
     finally:
         db.close()
 
@@ -475,6 +681,54 @@ def submit_news(payload: SubmitNewsRequest, _auth: bool = Depends(verify_submit_
         db.close()
 
 
+@app.get("/api/submit/crawler-sources")
+def list_crawler_sources(_auth: bool = Depends(verify_submit_basic)):
+    from crawler_sources import ensure_crawler_sources
+
+    db = SessionLocal()
+    try:
+        ensure_crawler_sources(db)
+        rows = (
+            db.query(CrawlerSource)
+            .order_by(CrawlerSource.category, CrawlerSource.sort_order, CrawlerSource.label)
+            .all()
+        )
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "slug": r.slug,
+                    "label": r.label,
+                    "category": r.category,
+                    "description": r.description or "",
+                    "enabled": bool(r.enabled),
+                    "sort_order": r.sort_order,
+                }
+                for r in rows
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.patch("/api/submit/crawler-sources/{slug}")
+def patch_crawler_source(
+    slug: str,
+    body: CrawlerSourcePatch,
+    _auth: bool = Depends(verify_submit_basic),
+):
+    db = SessionLocal()
+    try:
+        row = db.query(CrawlerSource).filter(CrawlerSource.slug == slug.strip()).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Unknown crawler source slug")
+        row.enabled = bool(body.enabled)
+        db.commit()
+        return {"status": "success", "data": {"slug": row.slug, "enabled": row.enabled}}
+    finally:
+        db.close()
+
+
 @app.get("/api/submit/news/history")
 def list_submit_news_history(_auth: bool = Depends(verify_submit_basic), limit: int = Query(80, ge=1, le=200)):
     db = SessionLocal()
@@ -548,30 +802,24 @@ def get_history(commodity: str, range_key: str = Query("7d", alias="range")):
             days = 1
         
         limit_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+        names = _expand_rice_history_names(commodity)
         history = db.query(CommodityPrice).filter(
-            CommodityPrice.name == commodity,
-            CommodityPrice.date_recorded >= limit_date
+            CommodityPrice.name.in_(names),
+            CommodityPrice.date_recorded >= limit_date,
         ).order_by(CommodityPrice.date_recorded.asc()).all()
 
-        if history:
-            labels = [h.date_recorded.strftime("%m-%d") if range_key != "1d" else h.date_recorded.strftime("%H:%M") for h in history]
-            prices = [h.price for h in history]
-            return {"status": "success", "data": {"labels": labels, "prices": prices, "name": commodity}}
-
-        # Fallback for rice/agriculture items normalized in PriceObservation
         obs_history = (
             db.query(PriceObservation)
             .filter(
-                PriceObservation.commodity_name == commodity,
+                PriceObservation.commodity_name.in_(names),
                 PriceObservation.observed_at >= limit_date,
             )
             .order_by(PriceObservation.observed_at.asc())
             .all()
         )
-        if not obs_history:
+        if not history and not obs_history:
             return {"status": "error", "message": "No data found"}
-        labels = [h.observed_at.strftime("%m-%d") if range_key != "1d" else h.observed_at.strftime("%H:%M") for h in obs_history]
-        prices = [h.price for h in obs_history]
+        labels, prices = _merge_cp_and_obs_history(history, obs_history, range_key)
         return {"status": "success", "data": {"labels": labels, "prices": prices, "name": commodity}}
     finally:
         db.close()
@@ -602,7 +850,9 @@ def get_news():
                 break
         if not data:
             from crawler import get_latest_news
-            return get_latest_news()
+            from crawler_sources import get_enabled_crawler_slugs
+
+            return get_latest_news(active_slugs=get_enabled_crawler_slugs(db))
         return {"status": "success", "data": data}
     finally:
         db.close()
@@ -874,8 +1124,14 @@ def backfill_prices(days: int = Query(30, ge=1, le=90)):
 
 @app.get("/api/stocks/news")
 def get_stock_news():
-    data = get_stock_market_news()
-    return {"status": "success", "data": data}
+    db = SessionLocal()
+    try:
+        from crawler_sources import get_enabled_crawler_slugs
+
+        data = get_stock_market_news(active_slugs=get_enabled_crawler_slugs(db))
+        return {"status": "success", "data": data}
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn

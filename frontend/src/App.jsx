@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { Line } from 'react-chartjs-2';
 import {
@@ -75,6 +75,9 @@ function SubmitPage() {
   const [submitTab, setSubmitTab] = useState('price');
   const [newsHistory, setNewsHistory] = useState([]);
   const [newsHistoryLoading, setNewsHistoryLoading] = useState(false);
+  const [crawlerSources, setCrawlerSources] = useState([]);
+  const [crawlerLoading, setCrawlerLoading] = useState(false);
+  const [crawlerStatus, setCrawlerStatus] = useState('');
 
   const gateOpen = !authConfig.basic_auth_enabled || submitAuth;
 
@@ -183,6 +186,56 @@ function SubmitPage() {
     if (!authConfigLoaded || !gateOpen || submitTab !== 'news') return;
     fetchNewsHistory();
   }, [authConfigLoaded, gateOpen, submitTab, fetchNewsHistory]);
+
+  const fetchCrawlerSources = useCallback(async () => {
+    setCrawlerLoading(true);
+    setCrawlerStatus('');
+    try {
+      const res = await axios.get(`${API_BASE}/submit/crawler-sources`, authOpts());
+      setCrawlerSources(res?.data?.data || []);
+    } catch (err) {
+      if (err?.response?.status === 401) {
+        clearStoredSubmitAuth();
+        setSubmitAuth(null);
+      }
+      setCrawlerStatus(`Không tải được danh sách nguồn: ${err?.response?.data?.detail || err.message}`);
+    } finally {
+      setCrawlerLoading(false);
+    }
+  }, [authOpts]);
+
+  useEffect(() => {
+    if (!authConfigLoaded || !gateOpen || submitTab !== 'crawler') return;
+    fetchCrawlerSources();
+  }, [authConfigLoaded, gateOpen, submitTab, fetchCrawlerSources]);
+
+  const crawlerByCategory = useMemo(() => {
+    const m = {};
+    for (const row of crawlerSources) {
+      const key = row.category || 'other';
+      if (!m[key]) m[key] = [];
+      m[key].push(row);
+    }
+    return m;
+  }, [crawlerSources]);
+
+  const categoryTitle = (c) =>
+    ({ price: 'Giá chuẩn hóa (crawler)', news: 'Tin nông nghiệp', stock_news: 'Tin chứng khoán (RSS)' }[c] || c);
+
+  const toggleCrawlerSource = async (slug, enabled) => {
+    setCrawlerStatus('');
+    try {
+      await axios.patch(
+        `${API_BASE}/submit/crawler-sources/${encodeURIComponent(slug)}`,
+        { enabled },
+        authOpts()
+      );
+      setCrawlerSources((prev) => prev.map((r) => (r.slug === slug ? { ...r, enabled } : r)));
+      setCrawlerStatus('Đã lưu. Lần chạy crawler tiếp theo và API fallback sẽ dùng cấu hình này.');
+    } catch (err) {
+      setCrawlerStatus(`Lỗi cập nhật: ${err?.response?.data?.detail || err.message}`);
+    }
+  };
 
   const onCommodityChange = (name) => {
     const selected = commodityOptions.find((x) => x.commodity_name === name);
@@ -315,6 +368,7 @@ function SubmitPage() {
               <div className="submit-tabs">
                 <button type="button" className={`submit-tab ${submitTab === 'price' ? 'active' : ''}`} onClick={() => setSubmitTab('price')}>Giá (Price)</button>
                 <button type="button" className={`submit-tab ${submitTab === 'news' ? 'active' : ''}`} onClick={() => setSubmitTab('news')}>Tin tức (NEWS)</button>
+                <button type="button" className={`submit-tab ${submitTab === 'crawler' ? 'active' : ''}`} onClick={() => setSubmitTab('crawler')}>Nguồn crawler</button>
               </div>
               {submitTab === 'price' && (
               <form onSubmit={submitPrice} style={{ border: '1px solid var(--border-color)', padding: 12, maxWidth: 560 }}>
@@ -340,6 +394,70 @@ function SubmitPage() {
                 <button type="submit" className="timeframe-btn active" style={{ marginTop: 8 }}>Submit giá</button>
                 <div style={{ marginTop: 8, color: 'var(--text-secondary)' }}>{priceStatus}</div>
               </form>
+              )}
+              {submitTab === 'crawler' && (
+              <div>
+                <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 0, lineHeight: 1.5, maxWidth: 720 }}>
+                  Bật/tắt từng nguồn mà job crawler định kỳ gọi (tin tức, giá chuẩn hóa, RSS chứng khoán). Các dòng chỉ tạo khi chưa có trong database; trạng thái bật/tắt được giữ lại sau khi deploy.
+                </p>
+                {crawlerLoading ? (
+                  <div style={{ padding: 12 }}>Đang tải danh sách nguồn...</div>
+                ) : (
+                  <div style={{ overflowX: 'auto', border: '1px solid var(--border-color)' }}>
+                    <table className="data-table">
+                      <thead>
+                        <tr>
+                          <th style={{ width: 100 }}>Bật</th>
+                          <th>Nguồn</th>
+                          <th>Slug</th>
+                          <th>Mô tả</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {crawlerSources.length === 0 && (
+                          <tr><td colSpan={4} style={{ padding: 12, color: 'var(--text-secondary)' }}>Chưa có dữ liệu hoặc lỗi tải.</td></tr>
+                        )}
+                        {Object.keys(crawlerByCategory)
+                          .sort((a, b) => {
+                            const order = { price: 0, news: 1, stock_news: 2 };
+                            return (order[a] ?? 9) - (order[b] ?? 9) || a.localeCompare(b);
+                          })
+                          .map((cat) => {
+                          const rows = crawlerByCategory[cat];
+                          if (!rows || rows.length === 0) return null;
+                          return (
+                            <React.Fragment key={cat}>
+                              <tr>
+                                <td colSpan={4} style={{ fontSize: 11, fontWeight: 600, background: 'rgba(0,255,65,0.06)', color: 'var(--accent)' }}>
+                                  {categoryTitle(cat)}
+                                </td>
+                              </tr>
+                              {rows.map((row) => (
+                                <tr key={row.slug}>
+                                  <td>
+                                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                                      <input
+                                        type="checkbox"
+                                        checked={!!row.enabled}
+                                        onChange={(e) => toggleCrawlerSource(row.slug, e.target.checked)}
+                                      />
+                                      <span style={{ fontSize: 11 }}>{row.enabled ? 'On' : 'Off'}</span>
+                                    </label>
+                                  </td>
+                                  <td style={{ fontWeight: 600, fontSize: 12 }}>{row.label}</td>
+                                  <td style={{ fontFamily: 'monospace', fontSize: 10, color: 'var(--text-secondary)' }}>{row.slug}</td>
+                                  <td style={{ fontSize: 11, color: 'var(--text-secondary)', maxWidth: 360 }}>{row.description}</td>
+                                </tr>
+                              ))}
+                            </React.Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-secondary)' }}>{crawlerStatus}</div>
+              </div>
               )}
               {submitTab === 'news' && (
               <div>
@@ -441,7 +559,7 @@ function App() {
   const [insightsSidebarTab, setInsightsSidebarTab] = useState('alerts');
 
   // Analytics State
-  const [selectedCommodity, setSelectedCommodity] = useState("Tôm Sú (Black Tiger)");
+  const [selectedCommodity, setSelectedCommodity] = useState("Tôm Sú (Black Tiger) 30 con/kg");
   const [timeframe, setTimeframe] = useState("30d");
   const [historyData, setHistoryData] = useState({ labels: [], prices: [] });
 
@@ -512,7 +630,15 @@ function App() {
     interaction: { mode: 'nearest', axis: 'x', intersect: false }
   };
 
-  const seafoodNames = ["Tôm Sú (Black Tiger)", "Tôm Thẻ (Vannamei)", "Cá Ba Sa (Pangasius)", "Cua Thịt (Mud Crab)", "Cua Gạch (Egg Crab)"];
+  const seafoodNames = [
+    "Tôm Sú (Black Tiger) 20 con/kg",
+    "Tôm Sú (Black Tiger) 30 con/kg",
+    "Tôm Sú (Black Tiger) 40 con/kg",
+    "Tôm Thẻ (Vannamei)",
+    "Cá Ba Sa (Pangasius)",
+    "Cua Thịt (Mud Crab)",
+    "Cua Gạch (Egg Crab)",
+  ];
   const isSeafood = (name = '') => {
     const n = name.toLowerCase();
     return seafoodNames.includes(name) || n.includes('tôm') || n.includes('cá') || n.includes('cua');
@@ -522,13 +648,33 @@ function App() {
     return n.includes('lúa') || n.includes('gạo') || n.includes('rice');
   };
   const vnSeafood = prices.filter(p => isSeafood(p.name));
-  const vnRice = prices.filter(p => isRice(p.name));
+  const riceDisplayOrder = [
+    'Giá lúa IR504',
+    'Giá gạo 5%',
+    'Lúa Thường (IR50404)',
+    'Gạo Xuất Khẩu 5%',
+  ];
+  const vnRiceRaw = prices.filter(p => isRice(p.name));
+  const vnRice = [...vnRiceRaw].sort((a, b) => {
+    const ia = riceDisplayOrder.indexOf(a.name);
+    const ib = riceDisplayOrder.indexOf(b.name);
+    const ra = ia === -1 ? 999 : ia;
+    const rb = ib === -1 ? 999 : ib;
+    if (ra !== rb) return ra - rb;
+    return a.name.localeCompare(b.name);
+  });
   const vnAgri = prices.filter(p => !isSeafood(p.name) && !isRice(p.name));
 
   const findByName = (name) => prices.find((p) => p.name === name);
-  const ir504 = findByName("Lúa Thường (IR50404)") || vnRice.find((p) => p.name.toLowerCase().includes('lúa'));
-  const rice5 = findByName("Gạo Xuất Khẩu 5%") || vnRice.find((p) => p.name.toLowerCase().includes('gạo'));
-  const blackTiger = findByName("Tôm Sú (Black Tiger)");
+  const ir504 =
+    findByName('Giá lúa IR504') ||
+    findByName('Lúa Thường (IR50404)') ||
+    vnRice.find((p) => p.name.toLowerCase().includes('lúa'));
+  const rice5 =
+    findByName('Giá gạo 5%') ||
+    findByName('Gạo Xuất Khẩu 5%') ||
+    vnRice.find((p) => p.name.toLowerCase().includes('gạo'));
+  const blackTiger = findByName("Tôm Sú (Black Tiger) 30 con/kg");
   const pangasius = findByName("Cá Ba Sa (Pangasius)");
   const exportTop = insights.export_analytics?.top_markets || [];
   const exportSpread = insights.export_analytics?.fob_cif_spread?.[0];
@@ -552,7 +698,7 @@ function App() {
     {
       key: 'black-tiger',
       group: 'seafood',
-      title: 'Giá tôm sú',
+      title: 'Giá tôm sú (30 con/kg)',
       item: blackTiger,
       value: blackTiger ? `${Math.round(blackTiger.price).toLocaleString()} VND/kg` : 'N/A'
     },

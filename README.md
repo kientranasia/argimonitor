@@ -125,3 +125,24 @@ docker compose exec crawler python -c "import scraper_job as s; s.run_scraper(ba
 - Khong commit API key that (`GEMINI_API_KEY`) vao git.
 - Neu da co key that trong file local, doi key moi truoc khi deploy production.
 - Doi `SUBMIT_BASIC_PASSWORD` truoc khi mo internet.
+
+## 9) SQLite — xoa ban ghi thu cong / reset du lieu
+
+Gia submit nam trong bang `price_observations`; gia thuy san legacy con trong `commodity_prices`.
+
+**Xoa tay (vi du Tôm Sú submit thua):**
+
+```bash
+sqlite3 backend/agrimonitor.db "DELETE FROM price_observations WHERE commodity_name = 'Tôm Sú (Black Tiger)' AND source = 'manual_submit';"
+```
+
+**Reset gan nhu moi (xoa DB + archive, crawler se tao lai):**
+
+```bash
+docker compose down
+rm -f backend/agrimonitor.db backend/agrimonitor.db-journal
+rm -rf backend/content_store/*
+docker compose up -d --build
+```
+
+(Luu y: mat toan bo du lieu local; chay lai seed + crawler.)

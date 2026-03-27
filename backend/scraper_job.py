@@ -9,6 +9,7 @@ from models import (
     NewsContentArchive,
 )
 import crawler
+from crawler_sources import ensure_crawler_sources, get_enabled_crawler_slugs
 import datetime
 import random
 from pathlib import Path
@@ -18,42 +19,44 @@ def recreate_db():
     Base.metadata.create_all(bind=engine)
 
 def seed_historical_prices():
-    """Generates 30 days of synthetic historical data for commodities if empty."""
+    """Generates 30 days of synthetic historical data per commodity name when that name has no rows yet."""
     db = SessionLocal()
-    
+
     commodities = [
-        {"name": "Tôm Sú (Black Tiger)", "base": 220000},
+        {"name": "Tôm Sú (Black Tiger) 20 con/kg", "base": 265000},
+        {"name": "Tôm Sú (Black Tiger) 30 con/kg", "base": 220000},
+        {"name": "Tôm Sú (Black Tiger) 40 con/kg", "base": 185000},
         {"name": "Tôm Thẻ (Vannamei)", "base": 145000},
         {"name": "Cá Ba Sa (Pangasius)", "base": 28500},
         {"name": "Cua Thịt (Mud Crab)", "base": 350000},
         {"name": "Cua Gạch (Egg Crab)", "base": 520000},
-        {"name": "Lúa Thường (IR50404)", "base": 8500},
-        {"name": "Gạo Xuất Khẩu 5%", "base": 16000},
+        {"name": "Giá lúa IR504", "base": 8500},
+        {"name": "Giá gạo 5%", "base": 16000},
         {"name": "Cà Phê (Robusta)", "base": 95000},
-        {"name": "Hồ Tiêu (Đắk Lắk)", "base": 93000}
+        {"name": "Hồ Tiêu (Đắk Lắk)", "base": 93000},
     ]
-    
-    # Check if we already seeded
-    first_com = db.query(CommodityPrice).filter(CommodityPrice.name == commodities[0]["name"]).first()
-    if not first_com:
-        print("Seeding 30-day historical data for Agriculture & Seafood...")
-        now = datetime.datetime.now(datetime.UTC)
-        for com in commodities:
-            current_price = com["base"]
-            for i in range(30, -1, -1):
-                variance = current_price * 0.02
-                current_price = round(current_price + random.uniform(-variance, variance))
-                trend = "up" if random.random() > 0.5 else "down"
-                
-                record_date = now - datetime.timedelta(days=i)
-                price_record = CommodityPrice(
-                    name=com["name"],
-                    price=current_price,
-                    unit="VND/kg",
-                    trend=trend,
-                    date_recorded=record_date
-                )
-                db.add(price_record)
+
+    now = datetime.datetime.now(datetime.UTC)
+    for com in commodities:
+        exists = db.query(CommodityPrice).filter(CommodityPrice.name == com["name"]).first()
+        if exists:
+            continue
+        print(f"Seeding 30-day historical data for {com['name']}...")
+        current_price = com["base"]
+        for i in range(30, -1, -1):
+            variance = current_price * 0.02
+            current_price = round(current_price + random.uniform(-variance, variance))
+            trend = "up" if random.random() > 0.5 else "down"
+
+            record_date = now - datetime.timedelta(days=i)
+            price_record = CommodityPrice(
+                name=com["name"],
+                price=current_price,
+                unit="VND/kg",
+                trend=trend,
+                date_recorded=record_date,
+            )
+            db.add(price_record)
         db.commit()
     db.close()
 
@@ -107,12 +110,23 @@ def run_scraper(backfill_days: int = 0):
     print("Starting scraper job...")
     db = SessionLocal()
     try:
+        ensure_crawler_sources(db)
+        crawl_slugs = get_enabled_crawler_slugs(db)
+
         # 1. Generate/Scraping new price for today dynamically
         # Since MVP uses synthetic random jumps from the latest day
         latest_prices_group = [
-            "Tôm Sú (Black Tiger)", "Tôm Thẻ (Vannamei)", "Cá Ba Sa (Pangasius)", 
-            "Cua Thịt (Mud Crab)", "Cua Gạch (Egg Crab)", 
-            "Lúa Thường (IR50404)", "Gạo Xuất Khẩu 5%", "Cà Phê (Robusta)", "Hồ Tiêu (Đắk Lắk)"
+            "Tôm Sú (Black Tiger) 20 con/kg",
+            "Tôm Sú (Black Tiger) 30 con/kg",
+            "Tôm Sú (Black Tiger) 40 con/kg",
+            "Tôm Thẻ (Vannamei)",
+            "Cá Ba Sa (Pangasius)",
+            "Cua Thịt (Mud Crab)",
+            "Cua Gạch (Egg Crab)",
+            "Giá lúa IR504",
+            "Giá gạo 5%",
+            "Cà Phê (Robusta)",
+            "Hồ Tiêu (Đắk Lắk)",
         ]
         for name in latest_prices_group:
             latest = db.query(CommodityPrice).filter(CommodityPrice.name == name).order_by(CommodityPrice.date_recorded.desc()).first()
@@ -171,7 +185,7 @@ def run_scraper(backfill_days: int = 0):
         db.commit()
 
         # 2. Scrape News (Now pulls 30-40 articles fast w/o Gemini)
-        news_data = crawler.get_latest_news()["data"]
+        news_data = crawler.get_latest_news(active_slugs=crawl_slugs)["data"]
         content_store_dir = Path(__file__).resolve().parent / "content_store"
         content_store_dir.mkdir(parents=True, exist_ok=True)
         for article in news_data:
@@ -251,7 +265,7 @@ def run_scraper(backfill_days: int = 0):
                         )
                     )
 
-        stock_news = crawler.get_stock_market_news()
+        stock_news = crawler.get_stock_market_news(active_slugs=crawl_slugs)
         for article in stock_news:
             link = article.get("link")
             if not link:
@@ -295,9 +309,11 @@ def run_scraper(backfill_days: int = 0):
 
         # 3. Scrape normalized price observations from VFA + AGROINFO
         if backfill_days and backfill_days > 0:
-            normalized_prices = crawler.get_normalized_price_observations_with_backfill(days=backfill_days)
+            normalized_prices = crawler.get_normalized_price_observations_with_backfill(
+                days=backfill_days, active_slugs=crawl_slugs
+            )
         else:
-            normalized_prices = crawler.get_normalized_price_observations()
+            normalized_prices = crawler.get_normalized_price_observations(active_slugs=crawl_slugs)
         for obs in normalized_prices:
             if obs.get("price") is None or obs.get("price") <= 0:
                 continue

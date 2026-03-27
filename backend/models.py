@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text
+from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, Text
 from database import Base
 import datetime
 
@@ -118,3 +118,18 @@ class SubmitNewsLog(Base):
     folder_type = Column(String, default="agriculture_news")
     description_preview = Column(String, default="")
     submitted_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class CrawlerSource(Base):
+    """Toggle which crawler feeds the scheduled job may call (managed from /submit)."""
+
+    __tablename__ = "crawler_sources"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String, unique=True, index=True, nullable=False)
+    label = Column(String, nullable=False)
+    category = Column(String, index=True, nullable=False)  # price | news | stock_news
+    description = Column(String, default="")
+    enabled = Column(Boolean, default=True, nullable=False)
+    sort_order = Column(Integer, default=0, index=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
