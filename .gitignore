@@ -1,0 +1,44 @@
+# Secrets — never commit (use .env.example as template)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+backend/venv/
+
+# Node / frontend build
+frontend/node_modules/
+frontend/dist/
+*.local
+
+# Local database & crawled archives (regenerate via crawler / scraper)
+*.db
+*.db-journal
+backend/agrimonitor.db
+backend/agrimonitor.db-journal
+/agrimonitor.db
+backend/content_store/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Logs
+*.log
+logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
