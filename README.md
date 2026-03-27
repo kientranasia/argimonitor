@@ -50,7 +50,7 @@ Bien quan trong:
 - `FRONTEND_PORT=8085`
 - `VITE_API_BASE=/api`
 - `CRAWLER_INTERVAL_SECONDS=1800` (30 phut)
-- `CRAWLER_INITIAL_BACKFILL_DAYS=30`
+- `CRAWLER_INITIAL_BACKFILL_DAYS=90`
 - `SUBMIT_BASIC_USER`, `SUBMIT_BASIC_PASSWORD`
 - `GEMINI_API_KEY` (tuy chon)
 - `OPENAI_API_KEY` (tuy chon — OpenAI khi khong dung Gemini; tao key tai [platform.openai.com/api-keys](https://platform.openai.com/api-keys))

@@ -44,7 +44,7 @@ services:
       DATABASE_URL: "sqlite:////app/agrimonitor.db"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       CRAWLER_INTERVAL_SECONDS: "${CRAWLER_INTERVAL_SECONDS:-1800}"
-      CRAWLER_INITIAL_BACKFILL_DAYS: "${CRAWLER_INITIAL_BACKFILL_DAYS:-30}"
+      CRAWLER_INITIAL_BACKFILL_DAYS: "${CRAWLER_INITIAL_BACKFILL_DAYS:-90}"
     volumes:
       - ./backend:/app
     command: sh /app/run_crawler_loop.sh

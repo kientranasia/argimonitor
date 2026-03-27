@@ -2,7 +2,7 @@
 set -eu
 
 INTERVAL_SECONDS="${CRAWLER_INTERVAL_SECONDS:-1800}"
-INITIAL_BACKFILL_DAYS="${CRAWLER_INITIAL_BACKFILL_DAYS:-30}"
+INITIAL_BACKFILL_DAYS="${CRAWLER_INITIAL_BACKFILL_DAYS:-90}"
 
 echo "[crawler] bootstrap database and seed data..."
 python -c "import scraper_job as s; s.recreate_db(); s.seed_historical_prices(); s.seed_historical_stocks(); s.run_scraper(backfill_days=${INITIAL_BACKFILL_DAYS})"
